@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<app version="1">
+  <name>Soldadura Sanjo Simulator</name>
+  <coder>WiiWeldSanjo</coder>
+  <version>1.0</version>
+  <release_date>20261105000000</release_date>
+  <short_description>Simulador de soldadura con puntero IR</short_description>
+  <long_description>Modulo de entrenamiento tecnico: segui el patron de costura con el Wiimote y mantene B para soldar. 6 niveles, calificacion final.</long_description>
+</app>
