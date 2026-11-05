@@ -1,0 +1,40 @@
+name: Compilar boot.dol para Wii
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkitppc:latest
+    steps:
+      - name: Bajar el proyecto
+        uses: actions/checkout@v4
+
+      - name: Bajar GRRLIB
+        uses: actions/checkout@v4
+        with:
+          repository: GRRLIB/GRRLIB
+          ref: a426e6170cbd9a4a69851a705637d753a09f8294
+          path: grrlib
+
+      - name: Instalar dependencias y GRRLIB
+        run: |
+          (dkp-pacman --sync --needed --noconfirm libfat-ogc ppc-libpng ppc-freetype ppc-libjpeg-turbo) || (pacman --sync --needed --noconfirm libfat-ogc ppc-libpng ppc-freetype ppc-libjpeg-turbo)
+          make -C grrlib/GRRLIB clean all install
+
+      - name: Compilar el juego
+        run: make
+
+      - name: Armar la carpeta para la SD
+        run: |
+          mkdir -p out/apps/WiiWeldSanjo
+          cp boot.dol meta.xml icon.png out/apps/WiiWeldSanjo/
+
+      - name: Subir resultado
+        uses: actions/upload-artifact@v4
+        with:
+          name: WiiWeldSanjo-para-la-SD
+          path: out/
