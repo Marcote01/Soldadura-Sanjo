@@ -1,7 +1,10 @@
 /*
  * SOLDADURA SANJO SIMULATOR - port a Wii (Homebrew)
- * Port del juego HTML. Toda la logica corre a paso fijo de 1/60 s,
+ * Basado en la version Android (APK). Toda la logica corre a paso fijo de 1/60 s,
  * asi el puntaje no depende de si la tele va a 50 o 60 Hz.
+ *
+ * Controles: puntero IR = mover la antorcha | A = elegir | B (mantener) = soldar
+ *            + = pausa | HOME = atras (juego -> pausa -> menu -> salir)
  */
 #include <math.h>
 #include <stdio.h>
@@ -10,13 +13,14 @@
 #include "game.h"
 #include "gfx.h"
 #include "plat.h"
+#include "save.h"
 
 #define PI_F          3.14159265f
 #define STEP          (1.0f / 60.0f)
 #define LEVEL_TIME    90.0f
 #define MAXPATH       256
-#define MAXSPARK      512
-#define MAXSMOKE      160
+#define MAXSPARK      260
+#define MAXSMOKE      60
 #define MAXHOT        160
 #define MAXCOLD       4000
 #define BEAD_COOL     1.5f      /* segundos hasta que el cordon queda gris */
@@ -24,7 +28,7 @@
 #define HEADER_H      56
 #define FOOTER_H      24
 
-enum { ST_MENU, ST_PLAY, ST_RESULTS };
+enum { ST_MENU, ST_PLAY, ST_PAUSE, ST_RESULTS };
 
 typedef struct { float x, y, tol; } GP;
 typedef struct { float x, y, vx, vy, life, decay, size; uint32_t col; } Spark;
@@ -47,12 +51,14 @@ static const char *LV_UP[6] = {
 };
 
 /* ------------------------------------------------------------------ estado */
+static SaveData S;                         /* ajustes + mejores puntajes */
 static int   st = ST_MENU;
 static int   level = 0;
 static float cur_x = 320, cur_y = 240;
 static int   cur_init = 0, cur_valid = 0;
 
-static float fy0, fw, fh;                 /* campo de juego */
+static float fy0, fw, fh;                  /* campo de juego */
+static float U = 1.0f;                     /* escala segun el alto del campo (igual que la APK) */
 
 static GP    path[MAXPATH];
 static int   plen = 0;
@@ -61,12 +67,13 @@ static int   progress = 0;
 static int   score = 0;
 static float psum = 0; static int pcnt = 0;
 static float heat = 0;
-static int   overheated = 0, need_release = 0, welding = 0;
+static int   overheated = 0, welding = 0;
 static float time_left = LEVEL_TIME;
 static int   last_sec = 90;
 static int   warn_flash = 0, warn_cd = 0;
 static int   tick = 0;
 static int   bead_count = 0;
+static int   rumble_left = 0, rumble_last = -1;
 
 static Spark sparks[MAXSPARK]; static int nspark = 0;
 static Smoke smokes[MAXSMOKE]; static int nsmoke = 0;
@@ -78,7 +85,7 @@ static int   have_last = 0; static float last_bx = 0, last_by = 0;
 static char  res_grade = 'D';
 static uint32_t res_col = 0;
 static float res_prec = 0, res_cov = 0, res_final = 0, res_time = 0;
-static int   res_total = 0;
+static int   res_total = 0, res_record = 0;
 static const char *res_feedback = "";
 
 /* ------------------------------------------------------------------- utils */
@@ -86,6 +93,20 @@ static uint32_t rng = 2463534242u;
 static float frand(void) {
     rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
     return (float)(rng >> 8) / 16777216.0f;
+}
+static float clampf(float v, float a, float b) { return v < a ? a : (v > b ? b : v); }
+
+/* sonido y vibracion respetan los ajustes */
+static void snd(int kind) { if (S.sound) plat_beep(kind); }
+static void pulse(int steps) { if (S.haptics && steps > rumble_left) rumble_left = steps; }
+
+static void rumble_update(void) {
+    int on = 0;
+    if (S.haptics) {
+        if (rumble_left > 0) { on = 1; rumble_left--; }
+        else if (welding && (tick % 3) == 0) on = 1;      /* zumbido suave: 1 de cada 3 pasos */
+    } else rumble_left = 0;
+    if (on != rumble_last) { plat_rumble(on); rumble_last = on; }
 }
 
 static float ctab_c[33][33], ctab_s[33][33];
@@ -120,6 +141,17 @@ static void ring(float cx, float cy, float r, float thick, uint32_t c, int segs)
         gfx_line(px, py, x, y, thick, c);
         px = x; py = y;
     }
+}
+
+static void star(float cx, float cy, float r, uint32_t c) {
+    Pt p[12]; uint32_t col[12];
+    int i;
+    p[0].x = cx; p[0].y = cy; col[0] = c;
+    for (i = 0; i <= 10; i++) {
+        float a = -PI_F / 2 + (float)i * PI_F / 5.0f, rr = (i % 2) ? r * 0.45f : r;
+        p[i + 1].x = cx + cosf(a) * rr; p[i + 1].y = cy + sinf(a) * rr; col[i + 1] = c;
+    }
+    gfx_fan(p, col, 12);
 }
 
 static void panel(float x, float y, float w, float h, uint32_t fill, uint32_t border) {
@@ -168,9 +200,21 @@ static int hit(const Rect *r, float px, float py) {
     return px >= r->x && px <= r->x + r->w && py >= r->y && py <= r->y + r->h;
 }
 
+/* numeros como en la APK (es-AR): separador de miles solo desde 10.000 */
+static void fmt_es(char *out, size_t n, int v) {
+    char tmp[24]; int l, i, k = 0;
+    snprintf(tmp, sizeof(tmp), "%d", v);
+    l = (int)strlen(tmp);
+    for (i = 0; i < l && (size_t)k < n - 2; i++) {
+        if (l >= 5 && i > 0 && (l - i) % 3 == 0) out[k++] = '.';
+        out[k++] = tmp[i];
+    }
+    out[k] = 0;
+}
+
 /* ----------------------------------------------------- camino guia (6 niveles) */
 static void add_pt(float x, float y, float tol) {
-    if (plen < MAXPATH) { path[plen].x = x; path[plen].y = y; path[plen].tol = tol; plen++; }
+    if (plen < MAXPATH) { path[plen].x = x; path[plen].y = y; path[plen].tol = tol * U * 1.1f; plen++; }
 }
 
 static void gen_path(void) {
@@ -243,11 +287,11 @@ static float closest(float px, float py, int *idx) {
 static void add_sparks(float x, float y, int n) {
     int i;
     for (i = 0; i < n && nspark < MAXSPARK; i++) {
-        float ang = frand() * PI_F * 2, spd = 2 + frand() * 8;
+        float ang = frand() * PI_F * 2, spd = (2 + frand() * 8) * U * 0.7f;
         Spark *s = &sparks[nspark++];
         s->x = x; s->y = y;
         s->vx = cosf(ang) * spd; s->vy = sinf(ang) * spd - frand() * 2;
-        s->life = 1; s->decay = 0.03f + frand() * 0.05f; s->size = 1.5f + frand() * 2.5f;
+        s->life = 1; s->decay = 0.03f + frand() * 0.05f; s->size = (1.5f + frand() * 2.5f) * U;
         s->col = (frand() > 0.3f) ? COL(56, 189, 248, 255) : COL(245, 158, 11, 255);
     }
 }
@@ -257,31 +301,48 @@ static void add_smoke(float x, float y) {
     s = &smokes[nsmoke++];
     s->x = x + (frand() - 0.5f) * 10; s->y = y - 5;
     s->vx = (frand() - 0.5f) * 0.8f; s->vy = -1 - frand() * 1.5f;
-    s->radius = 4 + frand() * 6; s->life = 0.8f; s->decay = 0.015f;
+    s->radius = (4 + frand() * 6) * U; s->life = 0.8f; s->decay = 0.015f;
 }
 
 /* ------------------------------------------------------------------- juego */
+static void stop_weld(void) {
+    if (welding) { welding = 0; plat_weld(0); }
+}
+
 static void start_game(void) {
     st = ST_PLAY;
     score = 0; psum = 0; pcnt = 0; heat = 0;
-    overheated = 0; need_release = 0; welding = 0;
-    time_left = LEVEL_TIME; last_sec = 90;
+    overheated = 0; welding = 0; plat_weld(0);
+    time_left = LEVEL_TIME; last_sec = -1;
     nspark = nsmoke = 0; hot_head = hot_n = 0; ncold = 0;
     have_last = 0; bead_count = 0; progress = 0; tick = 0;
     warn_flash = 0; warn_cd = 0;
     gen_path();
-    plat_beep(BEEP_START);
+    snd(BEEP_START);
+    pulse(2);
 }
 
-static void stop_weld(void) {
-    if (welding) { welding = 0; plat_weld(0); plat_rumble(0); }
+static void pause_game(void) {
+    if (st != ST_PLAY) return;
+    st = ST_PAUSE;
+    stop_weld();
+    warn_flash = 0;
+    pulse(2);
+}
+
+static void to_menu(void) {
+    st = ST_MENU;
+    stop_weld();
+    warn_flash = 0;
+    pulse(2);
 }
 
 static void finish_game(void) {
     float coverage, avg;
     stop_weld();
     st = ST_RESULTS;
-    plat_beep(BEEP_FINISH);
+    snd(BEEP_FINISH);
+    pulse(12);
 
     avg = pcnt > 0 ? (psum / pcnt) * 100.0f : 0.0f;
     coverage = (float)bead_count / (float)plen * 120.0f;
@@ -295,22 +356,32 @@ static void finish_game(void) {
         res_feedback = "¡Excelente nivel de maestría técnica! Mantuviste una distancia de arco constante, velocidad uniforme y una penetración homogénea en todo el trazado. Para sostener este nivel en soldadura real, asegurate de mantener el ángulo de trabajo a 45° y controlar adecuadamente la velocidad de enfriamiento del baño de fusión.";
     } else if (res_final >= 86.0f) {
         res_grade = 'B'; res_col = COL(56, 189, 248, 255);
-        res_feedback = "Buen desempeño técnico, aunque con pequeños detalles a corregir. Se observaron leves variaciones en el pulso y la alineación del cordón. Recomendación pedagógica: afianzá el apoyo de la mano guía, mantené un ritmo de avance constante para evitar socavaciones o exceso de aporte y estabilizá el puntero en las curvas.";
+        res_feedback = "Buen desempeño técnico, aunque con pequeños detalles a corregir. Se observaron leves variaciones en el pulso y la alineación del cordón. Recomendación pedagógica: afianzá el apoyo de la mano guía, mantené un ritmo de avance constante para evitar socavaciones o exceso de aporte y estabilizá el movimiento en las curvas.";
     } else if (res_final >= 51.0f) {
         res_grade = 'C'; res_col = COL(251, 191, 36, 255);
         res_feedback = "Calificación regular. Existen oscilaciones marcadas fuera del eje guía y discontinuidad en el cordón. Consejo técnico: practicá la postura de trabajo para mejorar el control motriz. Recordá que desviarse de la línea causa falta de fusión y porosidad en las juntas reales. Moderá la velocidad de avance.";
     } else {
         res_grade = 'D'; res_col = COL(239, 68, 68, 255);
-        res_feedback = "Calificación insuficiente (50% o menos). El cordón presenta desviaciones severas y falta de continuidad crítica. Diagnóstico técnico: falta de control del arco y movimiento errático. Recomendación: revisá la empuñadura del control, estabilizá los hombros, reducí la aceleración voluntaria y repetí el ejercicio guiando la vista 1 cm por delante del punto de fusión.";
+        res_feedback = "Calificación insuficiente (50% o menos). El cordón presenta desviaciones severas y falta de continuidad crítica. Diagnóstico técnico: falta de control del arco y movimiento errático. Recomendación: apoyá la mano para estabilizar el pulso, reducí la aceleración voluntaria y repetí el ejercicio guiando la vista 1 cm por delante del punto de fusión.";
     }
     res_time = LEVEL_TIME - time_left;
     res_total = (int)floorf((float)score + res_final * 50.0f + 0.5f);
+
+    res_record = (S.best[level] == 0 || res_total > S.best[level]);
+    if (res_record) {
+        S.best[level] = res_total;
+        S.grade[level] = res_grade;
+        save_store(&S);
+    }
 }
 
 void game_init(void) {
     fy0 = HEADER_H;
     fw = (float)GFX_W;
     fh = (float)(GFX_H - HEADER_H - FOOTER_H);
+    U = clampf(fh / 380.0f, 0.75f, 1.6f);
+    save_defaults(&S);
+    save_load(&S);
     st = ST_MENU; level = 0; cur_init = 0;
 }
 
@@ -319,21 +390,26 @@ void game_debug_set(int state, int lvl) {
     if (state == ST_PLAY) start_game(); else st = state;
 }
 
-/* rectangulos de botones */
+/* ------------------------------------------------------ rectangulos de botones */
 static float oy(void) { float o = (float)(GFX_H - 480) / 2.0f; return o > 0 ? o : 0; }
 static Rect lv_rect(int i) {
-    Rect r; r.w = 285; r.h = 56;
+    Rect r; r.w = 285; r.h = 58;
     r.x = (GFX_W - 585) / 2.0f + (float)(i % 2) * 300.0f;
-    r.y = oy() + 160 + (float)(i / 2) * 64.0f;
+    r.y = oy() + 92 + (float)(i / 2) * 66.0f;
     return r;
 }
-static Rect start_rect(void) { Rect r; r.w = 320; r.h = 48; r.x = (GFX_W - 320) / 2.0f; r.y = oy() + 364; return r; }
-static Rect again_rect(void) { Rect r; r.w = 200; r.h = 40; r.x = 100; r.y = oy() + 400; return r; }
-static Rect menu_rect(void)  { Rect r; r.w = 200; r.h = 40; r.x = 340; r.y = oy() + 400; return r; }
+static Rect tog_rect(int i) { Rect r; r.w = 210; r.h = 32; r.x = GFX_W / 2.0f + (i ? 10.0f : -220.0f); r.y = oy() + 292; return r; }
+static Rect start_rect(void) { Rect r; r.w = 320; r.h = 48; r.x = (GFX_W - 320) / 2.0f; r.y = oy() + 352; return r; }
+static Rect again_rect(void) { Rect r; r.w = 200; r.h = 40; r.x = 100; r.y = oy() + 404; return r; }
+static Rect menu_rect(void)  { Rect r; r.w = 200; r.h = 40; r.x = 340; r.y = oy() + 404; return r; }
+static Rect pausebtn_rect(void) { Rect r; r.w = 48; r.h = 36; r.x = (float)GFX_W - 62; r.y = 10; return r; }
+static Rect resume_rect(void)  { Rect r; r.w = 260; r.h = 46; r.x = (GFX_W - 260) / 2.0f; r.y = oy() + 188; return r; }
+static Rect restart_rect(void) { Rect r; r.w = 125; r.h = 40; r.x = (GFX_W - 260) / 2.0f; r.y = oy() + 246; return r; }
+static Rect pmenu_rect(void)   { Rect r; r.w = 125; r.h = 40; r.x = (GFX_W - 260) / 2.0f + 135; r.y = oy() + 246; return r; }
 
-int game_step(const Input *in) {
+/* ------------------------------------------------------------------- paso */
+static int step_inner(const Input *in) {
     int i;
-    if (in->home_press) return 1;
 
     cur_valid = in->ptr_valid;
     if (in->ptr_valid) {
@@ -341,12 +417,28 @@ int game_step(const Input *in) {
         else { cur_x += (in->x - cur_x) * 0.5f; cur_y += (in->y - cur_y) * 0.5f; }   /* suaviza el temblor del IR */
     }
 
+    /* HOME = "atras", igual que el boton Atras de la APK */
+    if (in->home_press) {
+        if (st == ST_PLAY) pause_game();
+        else if (st == ST_PAUSE || st == ST_RESULTS) to_menu();
+        else return 1;                               /* en el menu: salir al Homebrew Channel */
+        return 0;
+    }
+
     if (st == ST_MENU) {
         if (in->a_press && cur_valid) {
-            Rect s = start_rect();
+            Rect s = start_rect(), t0 = tog_rect(0), t1 = tog_rect(1);
             for (i = 0; i < 6; i++) {
                 Rect r = lv_rect(i);
-                if (hit(&r, cur_x, cur_y)) { level = i; plat_beep(BEEP_UI); }
+                if (hit(&r, cur_x, cur_y)) { level = i; snd(BEEP_UI); pulse(2); }
+            }
+            if (hit(&t0, cur_x, cur_y)) {
+                S.haptics = !S.haptics; save_store(&S);
+                if (S.haptics) pulse(4);
+            }
+            if (hit(&t1, cur_x, cur_y)) {
+                S.sound = !S.sound; save_store(&S);
+                if (S.sound) snd(BEEP_UI);
             }
             if (hit(&s, cur_x, cur_y)) start_game();
         }
@@ -357,12 +449,29 @@ int game_step(const Input *in) {
         if (in->a_press && cur_valid) {
             Rect a = again_rect(), m = menu_rect();
             if (hit(&a, cur_x, cur_y)) start_game();
-            else if (hit(&m, cur_x, cur_y)) { st = ST_MENU; plat_beep(BEEP_UI); }
+            else if (hit(&m, cur_x, cur_y)) { to_menu(); snd(BEEP_UI); }
+        }
+        return 0;
+    }
+
+    if (st == ST_PAUSE) {
+        if (in->plus_press) { st = ST_PLAY; pulse(2); return 0; }
+        if (in->a_press && cur_valid) {
+            Rect r = resume_rect(), q = restart_rect(), m = pmenu_rect();
+            if (hit(&r, cur_x, cur_y)) { st = ST_PLAY; snd(BEEP_UI); pulse(2); }
+            else if (hit(&q, cur_x, cur_y)) start_game();
+            else if (hit(&m, cur_x, cur_y)) { to_menu(); snd(BEEP_UI); }
         }
         return 0;
     }
 
     /* ---------------------------------------------------------- ST_PLAY */
+    if (in->plus_press) { pause_game(); return 0; }
+    if (in->a_press && cur_valid) {
+        Rect p = pausebtn_rect();
+        if (hit(&p, cur_x, cur_y)) { snd(BEEP_UI); pause_game(); return 0; }
+    }
+
     tick++;
     if (warn_cd > 0) warn_cd--;
     warn_flash = 0;
@@ -372,38 +481,40 @@ int game_step(const Input *in) {
     if (time_left < 0) time_left = 0;
     {
         int cs = (int)ceilf(time_left);
-        if (time_left <= 10.0f && cs != last_sec) { plat_beep(BEEP_TIMER); last_sec = cs; }
-        else if (time_left > 10.0f) last_sec = cs;
+        if (cs != last_sec) {
+            if (time_left <= 10.0f && last_sec != -1) snd(BEEP_TIMER);
+            last_sec = cs;
+        }
     }
     if (time_left <= 0) { finish_game(); return 0; }
 
-    /* entrada de soldadura: hay que soltar B despues de sobrecalentar */
-    if (!in->b_held) need_release = 0;
+    /* 2. estado de soldadura (B mantenido; si estaba sobrecalentada, retoma sola al enfriar) */
     {
-        int want = in->b_held && cur_valid && !overheated && !need_release;
-        if (want && !welding) { welding = 1; plat_weld(1); plat_rumble(1); have_last = 0; }
+        int want = in->b_held && cur_valid && !overheated;
+        if (want && !welding) { welding = 1; if (S.sound) plat_weld(1); pulse(4); have_last = 0; }
         if (!want && welding) stop_weld();
     }
 
-    /* 2. calor de la antorcha */
+    /* 3. calor de la antorcha */
     if (welding) {
         heat += 15.0f * STEP;
         if (heat >= 100.0f) {
-            heat = 100.0f; overheated = 1; need_release = 1;
+            heat = 100.0f; overheated = 1;
             stop_weld();
-            plat_beep(BEEP_WARN);
+            snd(BEEP_WARN);
+            pulse(12);
         }
     } else {
         heat -= 35.0f * STEP;
         if (heat <= 0) { heat = 0; overheated = 0; }
     }
 
-    /* 3. soldadura activa */
+    /* 4. soldadura activa */
     if (welding && cur_valid && cur_y >= fy0 && cur_y <= fy0 + fh) {
         int idx, wi, j;
         float dist, tol, dx, dy;
 
-        add_sparks(cur_x, cur_y, 8);
+        add_sparks(cur_x, cur_y, 4);
         add_smoke(cur_x, cur_y);
         bead_count++;
 
@@ -411,7 +522,7 @@ int game_step(const Input *in) {
         if (!have_last || dx * dx + dy * dy >= BEAD_SPACING * BEAD_SPACING) {
             if (hot_n < MAXHOT) {
                 Bead *b = &hot[(hot_head + hot_n) % MAXHOT];
-                b->x = cur_x; b->y = cur_y; b->r = 8 + frand() * 3; b->born = tick;
+                b->x = cur_x; b->y = cur_y; b->r = (8 + frand() * 3) * U; b->born = tick;
                 hot_n++;
                 last_bx = cur_x; last_by = cur_y; have_last = 1;
             }
@@ -424,10 +535,10 @@ int game_step(const Input *in) {
             psum += f; pcnt++;
             score += (int)floorf(10.0f * f + 0.5f);
         } else {
-            psum += 0; pcnt++;
+            pcnt++;
             score -= 5; if (score < 0) score = 0;
             warn_flash = 1;
-            if (warn_cd == 0) { plat_beep(BEEP_WARN); warn_cd = 8; }
+            if (warn_cd == 0) { snd(BEEP_WARN); pulse(2); warn_cd = 10; }
         }
 
         /* avance secuencial: solo cuenta si seguis el camino en orden */
@@ -466,12 +577,18 @@ int game_step(const Input *in) {
     return 0;
 }
 
+int game_step(const Input *in) {
+    int r = step_inner(in);
+    rumble_update();
+    return r;
+}
+
 /* ================================================================ DIBUJO */
 static void draw_metal_bg(float y0, float h) {
-    float x, y;
+    float x, y, g = 40.0f * U;
     gfx_rect(0, y0, (float)GFX_W, h, COL(30, 41, 59, 255));
-    for (x = 0; x < (float)GFX_W; x += 40) gfx_rect(x, y0, 1, h, COL(51, 65, 85, 255));
-    for (y = 0; y < h; y += 40) gfx_rect(0, y0 + y, (float)GFX_W, 1, COL(51, 65, 85, 255));
+    for (x = 0; x < (float)GFX_W; x += g) gfx_rect(x, y0, 1, h, COL(51, 65, 85, 255));
+    for (y = 0; y < h; y += g) gfx_rect(0, y0 + y, (float)GFX_W, 1, COL(51, 65, 85, 255));
 }
 
 static void draw_pointer(void) {
@@ -491,16 +608,31 @@ static void draw_button(const Rect *r, const char *label, int size, int hover, i
     text_c(r->x + r->w / 2, r->y + r->h / 2 - (float)size * 0.62f, label, size, COL(255, 255, 255, 255));
 }
 
+static void draw_toggle(const Rect *r, const char *label, int on) {
+    int hov = cur_valid && hit(r, cur_x, cur_y);
+    uint32_t fill = on ? COL(12, 74, 110, 250) : COL(30, 41, 59, 245);
+    uint32_t border = hov ? COL(186, 230, 253, 255) : (on ? COL(56, 189, 248, 200) : COL(71, 85, 105, 255));
+    char buf[48];
+    panel(r->x, r->y, r->w, r->h, fill, border);
+    snprintf(buf, sizeof(buf), "%s: %s", label, on ? "SÍ" : "NO");
+    text_c(r->x + r->w / 2, r->y + 6, buf, 16, on ? COL(125, 211, 252, 255) : COL(148, 163, 184, 255));
+}
+
 static void draw_menu(void) {
     float o = oy();
     int i;
     draw_metal_bg(0, (float)GFX_H);
     gfx_rect(0, 0, (float)GFX_W, (float)GFX_H, COL(2, 6, 23, 190));
 
-    text_c(GFX_W / 2.0f, o + 18, "SOLDADURA SANJO", 40, COL(241, 245, 249, 255));
-    text_c(GFX_W / 2.0f, o + 58, "SIMULATOR", 40, COL(56, 189, 248, 255));
-    text_c(GFX_W / 2.0f, o + 108, "Homebrew Wii Edition • Módulo de Entrenamiento Técnico", 13, COL(148, 163, 184, 255));
-    text_c(GFX_W / 2.0f, o + 130, "Elegí un patrón técnico de costura. Tenés 01:30 minutos para el ejercicio.", 14, COL(203, 213, 225, 255));
+    text_c(GFX_W / 2.0f, o + 8, "ENTRENAMIENTO TÉCNICO", 12, COL(125, 211, 252, 255));
+    {
+        int w1 = gfx_text_w("SOLDADURA ", 32), w2 = gfx_text_w("SANJO", 32), w3 = gfx_text_w(" SIMULATOR", 32);
+        float x = (GFX_W - (w1 + w2 + w3)) / 2.0f;
+        gfx_text(x, o + 24, "SOLDADURA ", 32, COL(241, 245, 249, 255));
+        gfx_text(x + w1, o + 24, "SANJO", 32, COL(56, 189, 248, 255));
+        gfx_text(x + w1 + w2, o + 24, " SIMULATOR", 32, COL(241, 245, 249, 255));
+    }
+    text_c(GFX_W / 2.0f, o + 66, "Elegí un patrón y seguí la línea con la antorcha. Tenés 01:30 minutos.", 14, COL(203, 213, 225, 255));
 
     for (i = 0; i < 6; i++) {
         Rect r = lv_rect(i);
@@ -509,33 +641,42 @@ static void draw_menu(void) {
         uint32_t fill = sel ? COL(12, 74, 110, 250) : (hov ? COL(51, 65, 85, 250) : COL(30, 41, 59, 245));
         uint32_t border = sel ? COL(251, 191, 36, 255) : (hov ? COL(186, 230, 253, 255) : COL(56, 189, 248, 110));
         panel(r.x, r.y, r.w, r.h, fill, border);
-        gfx_text(r.x + 14, r.y + 7, LV_NAME[i], 19, sel ? COL(253, 224, 71, 255) : COL(241, 245, 249, 255));
-        gfx_text(r.x + 14, r.y + 32, LV_DESC[i], 13, COL(148, 163, 184, 255));
+        gfx_text(r.x + 12, r.y + 6, LV_NAME[i], 18, sel ? COL(253, 224, 71, 255) : COL(241, 245, 249, 255));
+        gfx_text(r.x + 12, r.y + 33, LV_DESC[i], 13, COL(148, 163, 184, 255));
+        if (S.best[i] > 0) {
+            char num[24], buf[48];
+            fmt_es(num, sizeof(num), S.best[i]);
+            snprintf(buf, sizeof(buf), "Mejor: %c · %s", S.grade[i], num);
+            text_r(r.x + r.w - 10, r.y + 9, buf, 13, COL(251, 191, 36, 255));
+        }
     }
     {
-        Rect s = start_rect();
-        draw_button(&s, "INICIAR NIVEL (01:30)", 22, cur_valid && hit(&s, cur_x, cur_y), 1);
+        Rect t0 = tog_rect(0), t1 = tog_rect(1), s = start_rect();
+        draw_toggle(&t0, "VIBRACIÓN", S.haptics);
+        draw_toggle(&t1, "SONIDO", S.sound);
+        text_c(GFX_W / 2.0f, o + 330, "Apuntá con el Wiimote • A para elegir • mantené B para soldar", 13, COL(148, 163, 184, 255));
+        draw_button(&s, "INICIAR NIVEL", 22, cur_valid && hit(&s, cur_x, cur_y), 1);
     }
-    text_c(GFX_W / 2.0f, o + 424, "Wiimote P1 • Puntero IR + botón A para elegir • botón B para soldar", 13, COL(148, 163, 184, 255));
+    text_c(GFX_W / 2.0f, o + 414, "HOME: salir al Homebrew Channel", 12, COL(100, 116, 139, 255));
 
     gfx_rect(0, (float)GFX_H - FOOTER_H, (float)GFX_W, FOOTER_H, COL(15, 23, 42, 242));
     gfx_text(10, (float)GFX_H - FOOTER_H + 6, "WII READY | SD CARD: /apps/WiiWeldSanjo/boot.dol", 11, COL(125, 211, 252, 255));
     text_r((float)GFX_W - 10, (float)GFX_H - FOOTER_H + 6, "MODO: ENTRENAMIENTO", 11, COL(148, 163, 184, 255));
 
     if (cur_valid) draw_pointer();
-    else text_c(GFX_W / 2.0f, o + 446, "Apuntá el Wiimote a la pantalla", 15, COL(251, 191, 36, 255));
+    else text_c(GFX_W / 2.0f, o + 436, "Apuntá el Wiimote a la pantalla", 15, COL(251, 191, 36, 255));
 }
 
 static void draw_torch(float tx, float ty, int arc) {
-    const float cs = 0.8660254f, sn = 0.5f;
-#define TX(lx, ly) (tx + (lx) * cs - (ly) * sn)
-#define TY(lx, ly) (ty + (lx) * sn + (ly) * cs)
+    const float cs = 0.8660254f, sn = 0.5f, TS = 0.42f * U;
+#define TX(lx, ly) (tx + ((lx) * cs - (ly) * sn) * TS)
+#define TY(lx, ly) (ty + ((lx) * sn + (ly) * cs) * TS)
     uint32_t ink = COL(71, 85, 105, 255);
-    /* mira de precision */
-    ring(tx, ty, 4, 1.5f, arc ? COL(251, 191, 36, 255) : COL(56, 189, 248, 255), 12);
+    float t;
     /* cuello metalico */
-    gfx_line(TX(15, 13), TY(15, 13), TX(97, 75), TY(97, 75), 12, ink);
-    gfx_line(TX(15, 13), TY(15, 13), TX(97, 75), TY(97, 75), 9, COL(148, 163, 184, 255));
+    t = 12 * TS; if (t < 4) t = 4;
+    gfx_line(TX(15, 13), TY(15, 13), TX(97, 75), TY(97, 75), t, ink);
+    gfx_line(TX(15, 13), TY(15, 13), TX(97, 75), TY(97, 75), t - 2, COL(148, 163, 184, 255));
     /* boquilla ceramica */
     {
         Pt n[4] = { {TX(0, 0), TY(0, 0)}, {TX(16, 6), TY(16, 6)}, {TX(24, 14), TY(24, 14)}, {TX(6, 18), TY(6, 18)} };
@@ -547,27 +688,33 @@ static void draw_torch(float tx, float ty, int arc) {
         gfx_line(n[3].x, n[3].y, n[0].x, n[0].y, 1.5f, ink);
     }
     /* mango naranja y agarre de goma */
-    gfx_line(TX(82, 79), TY(82, 79), TX(176, 165), TY(176, 165), 27, ink);
-    gfx_line(TX(82, 79), TY(82, 79), TX(176, 165), TY(176, 165), 24, COL(234, 88, 12, 255));
-    gfx_line(TX(112, 86), TY(112, 86), TX(142, 106), TY(142, 106), 12, COL(15, 23, 42, 255));
+    t = 24 * TS; if (t < 8) t = 8;
+    gfx_line(TX(82, 79), TY(82, 79), TX(176, 165), TY(176, 165), t + 3, ink);
+    gfx_line(TX(82, 79), TY(82, 79), TX(176, 165), TY(176, 165), t, COL(234, 88, 12, 255));
+    t = 12 * TS; if (t < 4) t = 4;
+    gfx_line(TX(112, 86), TY(112, 86), TX(142, 106), TY(142, 106), t, COL(15, 23, 42, 255));
     /* guante */
     {
         Pt g[4] = { {TX(135, 135), TY(135, 135)}, {TX(240, 220), TY(240, 220)}, {TX(290, 170), TY(290, 170)}, {TX(170, 105), TY(170, 105)} };
         uint32_t c[4] = { COL(51, 65, 85, 255), COL(51, 65, 85, 255), COL(51, 65, 85, 255), COL(51, 65, 85, 255) };
         gfx_fan(g, c, 4);
-        gfx_line(g[0].x, g[0].y, g[1].x, g[1].y, 2, COL(30, 41, 59, 255));
-        gfx_line(g[1].x, g[1].y, g[2].x, g[2].y, 2, COL(30, 41, 59, 255));
-        gfx_line(g[2].x, g[2].y, g[3].x, g[3].y, 2, COL(30, 41, 59, 255));
-        gfx_line(g[3].x, g[3].y, g[0].x, g[0].y, 2, COL(30, 41, 59, 255));
+        gfx_line(g[0].x, g[0].y, g[1].x, g[1].y, 1.5f, COL(30, 41, 59, 255));
+        gfx_line(g[1].x, g[1].y, g[2].x, g[2].y, 1.5f, COL(30, 41, 59, 255));
+        gfx_line(g[2].x, g[2].y, g[3].x, g[3].y, 1.5f, COL(30, 41, 59, 255));
+        gfx_line(g[3].x, g[3].y, g[0].x, g[0].y, 1.5f, COL(30, 41, 59, 255));
     }
+    /* mira de precision en la punta */
+    ring(tx, ty, 4 * U, 1.5f, arc ? COL(251, 191, 36, 255) : COL(56, 189, 248, 255), 12);
 #undef TX
 #undef TY
 }
 
 static void draw_arc_glow(float x, float y) {
-    /* gradiente radial 0..45 px: blanco -> celeste -> transparente */
+    /* gradiente radial: blanco -> celeste -> transparente */
     uint32_t col[4];
+    float rr[3];
     int k, s, segs = 16;
+    rr[0] = 9 * U; rr[1] = 27 * U; rr[2] = 45 * U;
     col[0] = COL(255, 255, 255, 242);
     col[1] = COL(56, 189, 248, 204);
     col[2] = COL(14, 165, 233, 51);
@@ -577,35 +724,70 @@ static void draw_arc_glow(float x, float y) {
         p[0].x = x; p[0].y = y; c[0] = col[0];
         for (s = 0; s <= segs; s++) {
             float a = (float)s / segs * 2 * PI_F;
-            p[s + 1].x = x + cosf(a) * 9; p[s + 1].y = y + sinf(a) * 9; c[s + 1] = col[1];
+            p[s + 1].x = x + cosf(a) * rr[0]; p[s + 1].y = y + sinf(a) * rr[0]; c[s + 1] = col[1];
         }
         gfx_fan(p, c, segs + 2);
     }
-    {
-        static const float rr[4] = { 9, 27, 45, 0 };
-        for (k = 0; k < 2; k++) {
-            for (s = 0; s < segs; s++) {
-                float a0 = (float)s / segs * 2 * PI_F, a1 = (float)(s + 1) / segs * 2 * PI_F;
-                Pt q[4];
-                uint32_t qc[4];
-                q[0].x = x + cosf(a0) * rr[k];     q[0].y = y + sinf(a0) * rr[k];     qc[0] = col[k + 1];
-                q[1].x = x + cosf(a1) * rr[k];     q[1].y = y + sinf(a1) * rr[k];     qc[1] = col[k + 1];
-                q[2].x = x + cosf(a1) * rr[k + 1]; q[2].y = y + sinf(a1) * rr[k + 1]; qc[2] = col[k + 2];
-                q[3].x = x + cosf(a0) * rr[k + 1]; q[3].y = y + sinf(a0) * rr[k + 1]; qc[3] = col[k + 2];
-                gfx_fan(q, qc, 4);
-            }
+    for (k = 0; k < 2; k++) {
+        for (s = 0; s < segs; s++) {
+            float a0 = (float)s / segs * 2 * PI_F, a1 = (float)(s + 1) / segs * 2 * PI_F;
+            Pt q[4];
+            uint32_t qc[4];
+            q[0].x = x + cosf(a0) * rr[k];     q[0].y = y + sinf(a0) * rr[k];     qc[0] = col[k + 1];
+            q[1].x = x + cosf(a1) * rr[k];     q[1].y = y + sinf(a1) * rr[k];     qc[1] = col[k + 1];
+            q[2].x = x + cosf(a1) * rr[k + 1]; q[2].y = y + sinf(a1) * rr[k + 1]; qc[2] = col[k + 2];
+            q[3].x = x + cosf(a0) * rr[k + 1]; q[3].y = y + sinf(a0) * rr[k + 1]; qc[3] = col[k + 2];
+            gfx_fan(q, qc, 4);
         }
     }
 }
 
-static void draw_play(void) {
+static void draw_hud(void) {
+    char buf[64];
+    int cs = (int)ceilf(time_left);
+    float avg = pcnt > 0 ? psum / pcnt * 100.0f : 100.0f;
+    uint32_t tcol = (time_left <= 10.0f && ((tick / 15) & 1)) ? COL(248, 113, 113, 255)
+                  : (time_left <= 10.0f ? COL(239, 68, 68, 255) : COL(125, 211, 252, 255));
+    Rect pb = pausebtn_rect();
+    int hov = cur_valid && hit(&pb, cur_x, cur_y);
+
+    gfx_rect(0, 0, (float)GFX_W, HEADER_H, COL(15, 23, 42, 245));
+    gfx_rect(0, HEADER_H - 2, (float)GFX_W, 2, COL(56, 189, 248, 110));
+
+    gfx_text(16, 6, "TIEMPO", 11, COL(148, 163, 184, 255));
+    snprintf(buf, sizeof(buf), "%02d:%02d", cs / 60, cs % 60);
+    gfx_text(16, 20, buf, 28, tcol);
+
+    gfx_text(130, 6, "PRECISIÓN", 11, COL(148, 163, 184, 255));
+    snprintf(buf, sizeof(buf), "%.1f%%", avg);
+    gfx_text(130, 20, buf, 28, COL(52, 211, 153, 255));
+
+    gfx_text(282, 6, "PUNTAJE", 11, COL(148, 163, 184, 255));
+    snprintf(buf, sizeof(buf), "%05d", score);
+    gfx_text(282, 20, buf, 28, COL(251, 191, 36, 255));
+
+    gfx_text(436, 6, "TEMP ANTORCHA", 11, overheated ? COL(248, 113, 113, 255) : COL(148, 163, 184, 255));
+    gfx_rect(436, 22, 124, 16, overheated ? COL(127, 29, 29, 255) : COL(2, 6, 23, 255));
+    {
+        uint32_t hc = heat < 50 ? COL(34, 197, 94, 255) : (heat < 80 ? COL(245, 158, 11, 255) : COL(239, 68, 68, 255));
+        gfx_rect(437, 23, 122.0f * heat / 100.0f, 14, hc);
+    }
+    if (overheated) gfx_text(436, 39, "ENFRIANDO...", 11, COL(248, 113, 113, 255));
+
+    /* boton de pausa (A sobre el boton, o el boton +) */
+    panel(pb.x, pb.y, pb.w, pb.h, hov ? COL(51, 65, 85, 255) : COL(30, 41, 59, 245), hov ? COL(186, 230, 253, 255) : COL(56, 189, 248, 140));
+    gfx_rect(pb.x + 15, pb.y + 9, 6, 18, COL(226, 232, 240, 255));
+    gfx_rect(pb.x + 27, pb.y + 9, 6, 18, COL(226, 232, 240, 255));
+}
+
+static void draw_play(int with_cursor) {
     int i;
     draw_metal_bg(fy0, fh);
 
-    /* guia: banda de 22 px (color ya mezclado con el fondo) + linea punteada */
+    /* guia: banda de 22*U px (color ya mezclado con el fondo) + linea punteada */
     for (i = 0; i + 1 < plen; i++)
-        gfx_line(path[i].x, path[i].y, path[i + 1].x, path[i + 1].y, 22, COL(39, 93, 125, 255));
-    for (i = 0; i < plen; i++) circle(path[i].x, path[i].y, 11, COL(39, 93, 125, 255), 12);
+        gfx_line(path[i].x, path[i].y, path[i + 1].x, path[i + 1].y, 22 * U, COL(39, 93, 125, 255));
+    for (i = 0; i < plen; i++) circle(path[i].x, path[i].y, 11 * U, COL(39, 93, 125, 255), 12);
     {
         float carry = 0; int on = 1;
         for (i = 0; i + 1 < plen; i++) {
@@ -637,10 +819,10 @@ static void draw_play(void) {
         Bead *b = &hot[(hot_head + i) % MAXHOT];
         float age = (float)(tick - b->born) * STEP;
         if (age < 0.4f) {
-            circle(b->x, b->y, b->r + 6, COL(249, 115, 22, 90), 10);
+            circle(b->x, b->y, b->r + 4 * U, COL(249, 115, 22, 90), 10);
             circle(b->x, b->y, b->r, COL(255, 255, 255, 255), 10);
         } else {
-            circle(b->x, b->y, b->r + 3, COL(239, 68, 68, 70), 10);
+            circle(b->x, b->y, b->r + 4 * U, COL(239, 68, 68, 50), 10);
             circle(b->x, b->y, b->r, COL(249, 115, 22, 255), 10);
         }
     }
@@ -652,69 +834,46 @@ static void draw_play(void) {
         circle(s->x, s->y, s->size + 3, (s->col & 0xFFFFFF00u) | 70u, 6);
         circle(s->x, s->y, s->size, s->col, 6);
     }
-    if (welding && cur_valid) draw_arc_glow(cur_x, cur_y);
+    if (with_cursor && welding && cur_valid) draw_arc_glow(cur_x, cur_y);
 
-    if (warn_flash) gfx_rect(0, fy0, (float)GFX_W, fh, COL(220, 38, 38, 40));
+    if (warn_flash) gfx_rect(0, fy0, (float)GFX_W, fh, COL(220, 38, 38, 89));
 
-    if (cur_valid) draw_torch(cur_x, cur_y, welding);
-    else text_c(GFX_W / 2.0f, fy0 + fh / 2 - 10, "Apuntá el Wiimote a la pantalla", 20, COL(251, 191, 36, 255));
+    if (with_cursor) {
+        if (cur_valid) draw_torch(cur_x, cur_y, welding);
+        else text_c(GFX_W / 2.0f, fy0 + fh / 2 - 10, "Apuntá el Wiimote a la pantalla", 20, COL(251, 191, 36, 255));
+    }
 
     /* aviso de ultimos segundos */
     if (time_left <= 10.0f) {
-        Rect r; r.w = 300; r.h = 34; r.x = (GFX_W - 300) / 2.0f; r.y = fy0 + 8;
+        Rect r; r.w = 320; r.h = 34; r.x = (GFX_W - 320) / 2.0f; r.y = fy0 + 8;
         panel(r.x, r.y, r.w, r.h, COL(220, 38, 38, 245), COL(253, 224, 71, 255));
         text_c(GFX_W / 2.0f, r.y + 6, "¡ÚLTIMOS 10 SEGUNDOS!", 19, COL(255, 255, 255, 255));
     }
 
-    /* ---- HUD superior ---- */
-    {
-        char buf[64];
-        int cs = (int)ceilf(time_left);
-        float avg = pcnt > 0 ? psum / pcnt * 100.0f : 100.0f;
-        uint32_t tcol = (time_left <= 10.0f && ((tick / 15) & 1)) ? COL(248, 113, 113, 255)
-                      : (time_left <= 10.0f ? COL(239, 68, 68, 255) : COL(125, 211, 252, 255));
-        gfx_rect(0, 0, (float)GFX_W, HEADER_H, COL(15, 23, 42, 245));
-        gfx_rect(0, HEADER_H - 2, (float)GFX_W, 2, COL(56, 189, 248, 110));
+    draw_hud();
 
-        gfx_text(16, 6, "TIEMPO", 11, COL(148, 163, 184, 255));
-        snprintf(buf, sizeof(buf), "%02d:%02d", cs / 60, cs % 60);
-        gfx_text(16, 20, buf, 28, tcol);
-
-        gfx_text(130, 6, "PRECISIÓN", 11, COL(148, 163, 184, 255));
-        snprintf(buf, sizeof(buf), "%.1f%%", avg);
-        gfx_text(130, 20, buf, 28, COL(52, 211, 153, 255));
-
-        gfx_text(282, 6, "PUNTAJE", 11, COL(148, 163, 184, 255));
-        snprintf(buf, sizeof(buf), "%05d", score);
-        gfx_text(282, 20, buf, 28, COL(251, 191, 36, 255));
-
-        gfx_text(442, 6, "TEMP ANTORCHA", 11, COL(148, 163, 184, 255));
-        gfx_rect(442, 22, 182, 16, COL(2, 6, 23, 255));
-        {
-            uint32_t hc = heat < 50 ? COL(34, 197, 94, 255) : (heat < 80 ? COL(245, 158, 11, 255) : COL(239, 68, 68, 255));
-            gfx_rect(443, 23, 180.0f * heat / 100.0f, 14, hc);
-        }
-        if (overheated) gfx_text(442, 39, "SOBRECALENTADO • ENFRIANDO", 11, COL(248, 113, 113, 255));
-    }
     /* ---- pie ---- */
     gfx_rect(0, (float)GFX_H - FOOTER_H, (float)GFX_W, FOOTER_H, COL(15, 23, 42, 245));
     gfx_text(10, (float)GFX_H - FOOTER_H + 6, "WII READY | SD CARD: /apps/WiiWeldSanjo/boot.dol", 11, COL(125, 211, 252, 255));
     {
         char buf[96];
-        snprintf(buf, sizeof(buf), "MODO: %s • PRESIONAR 'HOME' PARA SALIR", LV_UP[level]);
+        snprintf(buf, sizeof(buf), "MODO: %s • + / HOME: PAUSA", LV_UP[level]);
         text_r((float)GFX_W - 10, (float)GFX_H - FOOTER_H + 6, buf, 11, COL(148, 163, 184, 255));
     }
 }
 
-static void fmt_thousands(char *out, size_t n, int v) {
-    char tmp[24]; int l, i, k = 0;
-    snprintf(tmp, sizeof(tmp), "%d", v);
-    l = (int)strlen(tmp);
-    for (i = 0; i < l && (size_t)k < n - 2; i++) {
-        if (i > 0 && (l - i) % 3 == 0) out[k++] = ',';
-        out[k++] = tmp[i];
-    }
-    out[k] = 0;
+static void draw_pause(void) {
+    float o = oy();
+    Rect r = resume_rect(), q = restart_rect(), m = pmenu_rect();
+    draw_play(0);
+    gfx_rect(0, 0, (float)GFX_W, (float)GFX_H, COL(2, 6, 23, 215));
+    panel((GFX_W - 320) / 2.0f, o + 130, 320, 190, COL(15, 23, 42, 250), COL(56, 189, 248, 150));
+    text_c(GFX_W / 2.0f, o + 142, "PAUSA", 32, COL(241, 245, 249, 255));
+    draw_button(&r, "CONTINUAR", 20, cur_valid && hit(&r, cur_x, cur_y), 1);
+    draw_button(&q, "REINICIAR", 16, cur_valid && hit(&q, cur_x, cur_y), 0);
+    draw_button(&m, "MENÚ", 16, cur_valid && hit(&m, cur_x, cur_y), 0);
+    text_c(GFX_W / 2.0f, o + 296, "+ continuar • HOME menú", 12, COL(100, 116, 139, 255));
+    if (cur_valid) draw_pointer();
 }
 
 static void draw_results(void) {
@@ -722,37 +881,41 @@ static void draw_results(void) {
     char buf[64], num[32], g[2];
     Rect a = again_rect(), m = menu_rect();
 
-    draw_play();                                       /* el cordon queda de fondo */
+    draw_play(0);                                      /* el cordon queda de fondo */
     gfx_rect(0, 0, (float)GFX_W, (float)GFX_H, COL(2, 6, 23, 238));
-    panel(50, o + 20, (float)GFX_W - 100, 440, COL(15, 23, 42, 250), COL(56, 189, 248, 150));
+    panel(50, o + 16, (float)GFX_W - 100, 448, COL(15, 23, 42, 250), COL(56, 189, 248, 150));
 
-    text_c(GFX_W / 2.0f, o + 32, "REPORTE TÉCNICO DE SOLDADURA", 24, COL(125, 211, 252, 255));
-    text_c(GFX_W / 2.0f, o + 64, "EVALUACIÓN DE PIEZA", 12, COL(148, 163, 184, 255));
+    text_c(GFX_W / 2.0f, o + 26, "REPORTE TÉCNICO DE SOLDADURA", 24, COL(125, 211, 252, 255));
+    text_c(GFX_W / 2.0f, o + 58, "EVALUACIÓN DE PIEZA", 12, COL(148, 163, 184, 255));
 
-    gfx_text(74, o + 98, "CALIFICACIÓN", 13, COL(148, 163, 184, 255));
+    gfx_text(74, o + 92, "CALIFICACIÓN", 13, COL(148, 163, 184, 255));
     g[0] = res_grade; g[1] = 0;
-    gfx_text(98, o + 112, g, 84, res_col);
+    gfx_text(98, o + 106, g, 84, res_col);
+    if (res_record) {
+        star(92, o + 218, 9, COL(251, 191, 36, 255));
+        gfx_text(106, o + 208, "¡NUEVO RÉCORD!", 13, COL(251, 191, 36, 255));
+    }
 
-    gfx_text(206, o + 100, "Precisión de Guía:", 16, COL(203, 213, 225, 255));
+    gfx_text(206, o + 94, "Precisión de Guía:", 16, COL(203, 213, 225, 255));
     snprintf(buf, sizeof(buf), "%.1f%%", res_prec);
-    text_r(556, o + 100, buf, 16, COL(255, 255, 255, 255));
+    text_r(556, o + 94, buf, 16, COL(255, 255, 255, 255));
 
-    gfx_text(206, o + 130, "Cobertura del Cordón:", 16, COL(203, 213, 225, 255));
+    gfx_text(206, o + 124, "Cobertura del Cordón:", 16, COL(203, 213, 225, 255));
     snprintf(buf, sizeof(buf), "%.1f%% (%.1f%% final)", res_cov, res_final);
-    text_r(556, o + 130, buf, 16, COL(255, 255, 255, 255));
+    text_r(556, o + 124, buf, 16, COL(255, 255, 255, 255));
 
-    gfx_text(206, o + 160, "Tiempo Empleado:", 16, COL(203, 213, 225, 255));
+    gfx_text(206, o + 154, "Tiempo Empleado:", 16, COL(203, 213, 225, 255));
     snprintf(buf, sizeof(buf), "%.1fs / 90s", res_time);
-    text_r(556, o + 160, buf, 16, COL(255, 255, 255, 255));
+    text_r(556, o + 154, buf, 16, COL(255, 255, 255, 255));
 
-    gfx_rect(206, o + 188, 346, 1, COL(56, 189, 248, 90));
-    gfx_text(206, o + 198, "PUNTAJE TOTAL:", 17, COL(203, 213, 225, 255));
-    fmt_thousands(num, sizeof(num), res_total);
+    gfx_rect(206, o + 182, 346, 1, COL(56, 189, 248, 90));
+    gfx_text(206, o + 192, "PUNTAJE TOTAL:", 17, COL(203, 213, 225, 255));
+    fmt_es(num, sizeof(num), res_total);
     snprintf(buf, sizeof(buf), "%s PTS", num);
-    text_r(556, o + 196, buf, 22, COL(251, 191, 36, 255));
+    text_r(556, o + 190, buf, 22, COL(251, 191, 36, 255));
 
     gfx_rect(82, o + 238, (float)GFX_W - 164, 1, COL(56, 189, 248, 90));
-    wrap_draw(88, o + 250, (float)GFX_W - 176, res_feedback, 14, COL(203, 213, 225, 255), 19);
+    wrap_draw(88, o + 248, (float)GFX_W - 176, res_feedback, 14, COL(203, 213, 225, 255), 19);
 
     draw_button(&a, "REPETIR", 20, cur_valid && hit(&a, cur_x, cur_y), 1);
     draw_button(&m, "MENÚ", 20, cur_valid && hit(&m, cur_x, cur_y), 0);
@@ -762,7 +925,8 @@ static void draw_results(void) {
 void game_draw(void) {
     gfx_begin();
     if (st == ST_MENU) draw_menu();
-    else if (st == ST_PLAY) draw_play();
+    else if (st == ST_PLAY) draw_play(1);
+    else if (st == ST_PAUSE) draw_pause();
     else draw_results();
     gfx_end();
 }

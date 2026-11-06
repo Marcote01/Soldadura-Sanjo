@@ -10,6 +10,7 @@
 #include "gfx.h"
 #include "game.h"
 #include "plat.h"
+#include "save.h"
 
 #define SR 32000                       /* frecuencia de los sonidos generados */
 #define STEP_US 16667.0                /* 1/60 s */
@@ -81,16 +82,26 @@ void plat_rumble(int on) { WPAD_Rumble(0, on ? 1 : 0); }
 /* -------------------------------------------------------------- main */
 int main(int argc, char **argv) {
     Input in;
-    int pa = 0, pb = 0, ph = 0;
+    int pa = 0, pb = 0, pp = 0, ph = 0;
+    char dir[256] = "sd:/apps/WiiWeldSanjo/";
     u64 prev;
     double acc = 0.0;
-    (void)argc; (void)argv;
 
     if (!gfx_init()) return 1;
     WPAD_Init();
     WPAD_SetDataFormat(WPAD_CHAN_0, WPAD_FMT_BTNS_ACC_IR);
     WPAD_SetVRes(WPAD_CHAN_0, (u32)GFX_W, (u32)GFX_H);
     audio_init();
+
+    /* scores.txt se guarda al lado del boot.dol (HBC pasa la ruta en argv[0]) */
+    if (argc > 0 && argv && argv[0]) {
+        const char *sl = strrchr(argv[0], '/');
+        if (sl && strchr(argv[0], ':') && (size_t)(sl - argv[0]) < 200) {
+            memcpy(dir, argv[0], (size_t)(sl - argv[0]) + 1);
+            dir[(size_t)(sl - argv[0]) + 1] = 0;
+        }
+    }
+    save_init(dir);
     SYS_SetResetCallback(on_reset);
     SYS_SetPowerCallback(on_power);
 
@@ -116,11 +127,12 @@ int main(int argc, char **argv) {
         in.b_held = (held & WPAD_BUTTON_B) ? 1 : 0;
         if (down & WPAD_BUTTON_A)    pa = 1;
         if (down & WPAD_BUTTON_B)    pb = 1;
+        if (down & WPAD_BUTTON_PLUS) pp = 1;
         if (down & WPAD_BUTTON_HOME) ph = 1;
 
         while (acc >= STEP_US) {
-            in.a_press = pa; in.b_press = pb; in.home_press = ph;
-            pa = pb = ph = 0;
+            in.a_press = pa; in.b_press = pb; in.plus_press = pp; in.home_press = ph;
+            pa = pb = pp = ph = 0;
             if (game_step(&in)) want_exit = 1;
             acc -= STEP_US;
         }

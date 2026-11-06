@@ -7,6 +7,7 @@ typedef struct {
     int   a_press;     /* A recien apretado */
     int   b_press;     /* B recien apretado */
     int   b_held;      /* B mantenido */
+    int   plus_press;  /* + recien apretado (pausa) */
     int   home_press;  /* HOME recien apretado */
 } Input;
 
